@@ -1,0 +1,23 @@
+services:
+  # Full lint + test suite in a container - no local Rust toolchain needed:
+  #   docker compose run --rm test
+  test:
+    image: rust:1.91
+    working_dir: /work
+    volumes:
+      - .:/work
+      # Named volumes keep the cargo registry and build artifacts between
+      # runs, so re-runs are fast and the host target/ dir stays untouched.
+      - cargo-registry:/usr/local/cargo/registry
+      - target:/work/target
+    environment:
+      CARGO_TERM_COLOR: always
+    command: >
+      bash -c "rustup component add rustfmt clippy
+      && cargo fmt --check
+      && cargo clippy --all-targets -- -D warnings
+      && cargo test"
+
+volumes:
+  cargo-registry:
+  target:

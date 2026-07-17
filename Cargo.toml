@@ -1,0 +1,22 @@
+[package]
+name = "xshellz"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/xshellz/xshellz-rust"
+description = "Official Rust SDK for xShellz sandboxes: throwaway, gVisor-isolated Linux boxes you can spawn and run commands in from your own program."
+keywords = ["sandbox", "ssh", "gvisor", "remote-execution"]
+categories = ["api-bindings", "development-tools", "virtualization"]
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "fs", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ssh-key = { version = "0.7.0-rc.11", features = ["ed25519", "getrandom"] }
+russh = "0.62"
+thiserror = "2"
+
+[dev-dependencies]
+wiremock = "0.6"
+regex = "1"

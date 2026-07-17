@@ -32,6 +32,21 @@ pub enum Error {
     #[error("{0}")]
     NotRunning(String),
 
+    /// [`Sandbox::get_or_create`](crate::Sandbox::get_or_create) found an
+    /// existing sandbox with the requested name but no private key for it -
+    /// neither an explicit `private_key` option nor a keystore file.
+    ///
+    /// The message says where a key was expected. Recover by passing the key
+    /// explicitly, restoring the keystore file, or destroying the box.
+    #[error("{0}")]
+    MissingKey(String),
+
+    /// [`Sandbox::run_code`](crate::Sandbox::run_code) was called with a
+    /// language the SDK does not support. The message lists the supported
+    /// languages.
+    #[error("{0}")]
+    UnsupportedLanguage(String),
+
     /// A command executed with a [`RunOptions::timeout`](crate::RunOptions::timeout)
     /// exceeded its deadline.
     #[error("{0}")]

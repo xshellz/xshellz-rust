@@ -100,6 +100,14 @@ impl ApiClient {
         self.request_json(Method::POST, path, body).await
     }
 
+    pub async fn put<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<T> {
+        self.request_json(Method::PUT, path, body).await
+    }
+
     pub async fn delete(&self, path: &str) -> Result<()> {
         self.request(Method::DELETE, path, None).await.map(|_| ())
     }

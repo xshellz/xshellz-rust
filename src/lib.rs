@@ -25,11 +25,17 @@
 mod config;
 mod error;
 mod http;
+mod jobs;
 mod keys;
+mod keystore;
 mod models;
 mod sandbox;
 mod transport;
 
 pub use error::{Error, Result};
-pub use models::{CommandResult, SandboxInfo};
-pub use sandbox::{ConnectOptions, CreateOptions, ListOptions, RunOptions, Sandbox};
+pub use jobs::{JobHandle, JobInfo, SpawnOptions};
+pub use models::{CommandResult, ProcessInfo, SandboxInfo, SandboxProcs, SandboxStats};
+pub use sandbox::{
+    BoxfileOptions, ConnectOptions, CreateOptions, GetOrCreateOptions, ListOptions, RunOptions,
+    Sandbox,
+};

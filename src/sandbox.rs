@@ -1,18 +1,21 @@
 //! The [`Sandbox`] - a throwaway, gVisor-isolated Linux box.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
 
+use serde::Deserialize;
 use serde_json::json;
 use ssh_key::PrivateKey;
 
 use crate::error::{Error, Result};
 use crate::http::ApiClient;
+use crate::jobs::{self, JobHandle, JobInfo, SpawnOptions};
 use crate::keys;
-use crate::models::{CommandResult, SandboxInfo};
+use crate::keystore;
+use crate::models::{CommandResult, SandboxInfo, SandboxProcs, SandboxStats};
 use crate::transport::{
     build_shell_command, shell_quote, ExecOutput, ExecRequest, OutputCallback, RusshTransport,
     Transport,
@@ -76,6 +79,125 @@ impl CreateOptions {
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+}
+
+/// Where [`Sandbox::get_or_create`] looks for / persists private keys.
+#[derive(Debug, Clone, Default)]
+enum KeystoreSetting {
+    /// `~/.xshellz/keys/` (resolved via `$HOME`).
+    #[default]
+    Default,
+    /// A custom directory.
+    Dir(PathBuf),
+    /// No keystore: create-only-or-error semantics.
+    Disabled,
+}
+
+/// Options for [`Sandbox::get_or_create`].
+///
+/// ```no_run
+/// # use xshellz::{GetOrCreateOptions, Sandbox};
+/// # async fn demo() -> xshellz::Result<()> {
+/// let sbx = Sandbox::get_or_create("build-box", GetOrCreateOptions::default()).await?;
+/// # Ok(()) }
+/// ```
+#[derive(Debug, Clone)]
+pub struct GetOrCreateOptions {
+    pub(crate) api_key: Option<String>,
+    pub(crate) api_url: Option<String>,
+    pub(crate) timeout: Duration,
+    pub(crate) private_key: Option<String>,
+    keystore: KeystoreSetting,
+}
+
+impl Default for GetOrCreateOptions {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            api_url: None,
+            timeout: DEFAULT_HTTP_TIMEOUT,
+            private_key: None,
+            keystore: KeystoreSetting::Default,
+        }
+    }
+}
+
+impl GetOrCreateOptions {
+    /// Explicit API key (overrides `XSHELLZ_API_KEY`).
+    #[must_use]
+    pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
+    }
+
+    /// Explicit API base URL (overrides `XSHELLZ_API_URL`).
+    #[must_use]
+    pub fn api_url(mut self, api_url: impl Into<String>) -> Self {
+        self.api_url = Some(api_url.into());
+        self
+    }
+
+    /// HTTP timeout for control-plane requests (default 120s).
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Explicit OpenSSH private key for an *existing* box with this name
+    /// (wins over any keystore lookup).
+    #[must_use]
+    pub fn private_key(mut self, private_key_openssh: impl Into<String>) -> Self {
+        self.private_key = Some(private_key_openssh.into());
+        self
+    }
+
+    /// Use a custom keystore directory instead of `~/.xshellz/keys/`.
+    #[must_use]
+    pub fn keystore_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.keystore = KeystoreSetting::Dir(dir.into());
+        self
+    }
+
+    /// Disable the keystore entirely: newly generated keys are not persisted,
+    /// and attaching to an existing box requires an explicit
+    /// [`private_key`](Self::private_key).
+    #[must_use]
+    pub fn no_keystore(mut self) -> Self {
+        self.keystore = KeystoreSetting::Disabled;
+        self
+    }
+
+    fn resolved_keystore(&self) -> Option<PathBuf> {
+        match &self.keystore {
+            KeystoreSetting::Default => keystore::default_dir(),
+            KeystoreSetting::Dir(dir) => Some(dir.clone()),
+            KeystoreSetting::Disabled => None,
+        }
+    }
+}
+
+/// Options for [`Sandbox::get_boxfile`] / [`Sandbox::set_boxfile`].
+#[derive(Debug, Clone, Default)]
+pub struct BoxfileOptions {
+    pub(crate) api_key: Option<String>,
+    pub(crate) api_url: Option<String>,
+}
+
+impl BoxfileOptions {
+    /// Explicit API key (overrides `XSHELLZ_API_KEY`).
+    #[must_use]
+    pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
+    }
+
+    /// Explicit API base URL (overrides `XSHELLZ_API_URL`).
+    #[must_use]
+    pub fn api_url(mut self, api_url: impl Into<String>) -> Self {
+        self.api_url = Some(api_url.into());
         self
     }
 }
@@ -229,18 +351,12 @@ impl Sandbox {
     ///   the plan has no sandbox entitlement.
     /// - [`Error::Api`]: other API failures (throttle 429, capacity 503, ...).
     pub async fn create(options: CreateOptions) -> Result<Self> {
-        let keypair = keys::generate_keypair(keys::DEFAULT_KEY_COMMENT)?;
         let api = ApiClient::new(
             options.api_key.as_deref(),
             options.api_url.as_deref(),
             options.timeout,
         )?;
-
-        let mut body = json!({ "ssh_public_key": keypair.public_key_line });
-        if let Some(name) = &options.name {
-            body["name"] = json!(name);
-        }
-        let info: SandboxInfo = api.post("/shells/agent", Some(body)).await?;
+        let (info, keypair) = Self::spawn_new(&api, options.name.as_deref()).await?;
 
         Ok(Self::assemble(
             info,
@@ -248,6 +364,104 @@ impl Sandbox {
             Some(keypair.private_key),
             Some(keypair.private_key_openssh),
         ))
+    }
+
+    /// Generate a keypair and POST the create request.
+    async fn spawn_new(
+        api: &ApiClient,
+        name: Option<&str>,
+    ) -> Result<(SandboxInfo, keys::KeyPair)> {
+        let keypair = keys::generate_keypair(keys::DEFAULT_KEY_COMMENT)?;
+        let mut body = json!({ "ssh_public_key": keypair.public_key_line });
+        if let Some(name) = name {
+            body["name"] = json!(name);
+        }
+        let info: SandboxInfo = api.post("/shells/agent", Some(body)).await?;
+        Ok((info, keypair))
+    }
+
+    /// Attach to the sandbox named `name`, creating it if it does not exist -
+    /// the "permanent named box" workflow.
+    ///
+    /// - **Not found**: the box is created (like [`create`](Self::create) with
+    ///   that name) and, unless the keystore is disabled, the generated
+    ///   private key is persisted to `<keystore>/<sanitized-name>.key`
+    ///   (default keystore: `~/.xshellz/keys/`, file mode 0600).
+    /// - **Found**: the private key is resolved - an explicit
+    ///   [`private_key`](GetOrCreateOptions::private_key) wins, else the
+    ///   keystore file is loaded - and the SDK attaches to the existing box.
+    ///   If the box is idle-stopped it is [`start`](Self::start)ed first.
+    ///
+    /// **Security note:** the keystore stores the private key in plaintext on
+    /// disk (0600). Delete the key file to revoke local access; destroy the
+    /// box to rotate for real.
+    ///
+    /// The returned `Sandbox` is [`detach`](Self::detach)ed: this is a
+    /// *permanent* box, so dropping the handle (or calling
+    /// [`close`](Self::close)) leaves the box running. Destroy it explicitly
+    /// with [`kill`](Self::kill).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::MissingKey`]: the box exists but no private key was found
+    ///   (the message says which keystore path was checked).
+    /// - Everything [`create`](Self::create), [`list`](Self::list), and
+    ///   [`start`](Self::start) can return.
+    pub async fn get_or_create(name: &str, options: GetOrCreateOptions) -> Result<Self> {
+        let api = ApiClient::new(
+            options.api_key.as_deref(),
+            options.api_url.as_deref(),
+            options.timeout,
+        )?;
+        let keystore_dir = options.resolved_keystore();
+
+        let all: Vec<SandboxInfo> = api.get("/shells/agent").await?;
+        let Some(info) = all.into_iter().find(|info| info.name == name) else {
+            let (info, keypair) = Self::spawn_new(&api, Some(name)).await?;
+            if let Some(dir) = &keystore_dir {
+                keystore::save(dir, name, &keypair.private_key_openssh)?;
+            }
+            let sandbox = Self::assemble(
+                info,
+                api,
+                Some(keypair.private_key),
+                Some(keypair.private_key_openssh),
+            );
+            // Permanent box: never destroy it on drop - only kill() does.
+            sandbox.detach();
+            return Ok(sandbox);
+        };
+
+        let pem = match options.private_key {
+            Some(pem) => pem,
+            None => match &keystore_dir {
+                Some(dir) => keystore::load(dir, name)?.ok_or_else(|| {
+                    Error::MissingKey(format!(
+                        "Sandbox {name:?} already exists but no private key was \
+                         found at {:?}. Pass GetOrCreateOptions::private_key(...) \
+                         with the key it was created with, restore that file, or \
+                         destroy the box and let get_or_create recreate it.",
+                        keystore::key_path(dir, name)
+                    ))
+                })?,
+                None => {
+                    return Err(Error::MissingKey(format!(
+                        "Sandbox {name:?} already exists and the keystore is \
+                         disabled - pass GetOrCreateOptions::private_key(...) \
+                         with the key it was created with."
+                    )));
+                }
+            },
+        };
+        let key = keys::load_private_key(&pem)?;
+        let running = info.status == STATUS_RUNNING;
+        let sandbox = Self::assemble(info, api, Some(key), Some(pem));
+        // Permanent box: never destroy it on drop - only kill() does.
+        sandbox.detach();
+        if !running {
+            sandbox.start().await?;
+        }
+        Ok(sandbox)
     }
 
     /// Attach to an existing sandbox by UUID.
@@ -286,6 +500,45 @@ impl Sandbox {
             DEFAULT_HTTP_TIMEOUT,
         )?;
         api.get("/shells/agent").await
+    }
+
+    /// Fetch the account's saved `xshellz.box` manifest (the provisioning
+    /// template seeded into `~/xshellz.box` on every **newly created** box -
+    /// preinstall packages, etc.). `None` when no manifest is saved.
+    ///
+    /// Account-level: `GET /v1/shells/agent/boxfile`.
+    pub async fn get_boxfile(options: BoxfileOptions) -> Result<Option<String>> {
+        let api = ApiClient::new(
+            options.api_key.as_deref(),
+            options.api_url.as_deref(),
+            DEFAULT_HTTP_TIMEOUT,
+        )?;
+        let response: BoxfileManifest = api.get("/shells/agent/boxfile").await?;
+        Ok(response.manifest)
+    }
+
+    /// Save (or clear, with `None`) the account's `xshellz.box` manifest and
+    /// return the stored value.
+    ///
+    /// The manifest applies when the **next** box is created - existing boxes
+    /// are not touched. Account-level: `PUT /v1/shells/agent/boxfile`
+    /// (`manifest` is capped at 16 KiB server-side).
+    pub async fn set_boxfile(
+        manifest: Option<&str>,
+        options: BoxfileOptions,
+    ) -> Result<Option<String>> {
+        let api = ApiClient::new(
+            options.api_key.as_deref(),
+            options.api_url.as_deref(),
+            DEFAULT_HTTP_TIMEOUT,
+        )?;
+        let response: BoxfileManifest = api
+            .put(
+                "/shells/agent/boxfile",
+                Some(json!({ "manifest": manifest })),
+            )
+            .await?;
+        Ok(response.manifest)
     }
 
     /// Resolve one sandbox via the list endpoint (there is no GET show).
@@ -461,7 +714,133 @@ impl Sandbox {
         Ok(())
     }
 
-    async fn exec(&self, request: ExecRequest) -> Result<ExecOutput> {
+    /// Start a background process in the sandbox and return a [`JobHandle`].
+    ///
+    /// The command runs under `nohup bash -c`, detached from the SSH session,
+    /// with stdout+stderr redirected to `~/.xshellz/jobs/<job_id>.log` (pid
+    /// recorded next to it in `<job_id>.pid`). The job keeps running after
+    /// this process exits - but not across a box stop/restart.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`run`](Self::run) can return, plus an [`Error::Io`] when
+    /// the box did not report a pid back.
+    pub async fn spawn(&self, command: &str, options: SpawnOptions) -> Result<JobHandle<'_>> {
+        let id = match &options.name {
+            Some(name) => format!("{}-{}", keystore::sanitize_name(name), jobs::short_id()),
+            None => jobs::short_id(),
+        };
+        let script = format!(
+            "mkdir -p \"$HOME/.xshellz/jobs\"\n\
+             nohup bash -c {command} > \"$HOME/.xshellz/jobs/{id}.log\" 2>&1 < /dev/null &\n\
+             pid=$!\n\
+             echo \"$pid\" > \"$HOME/.xshellz/jobs/{id}.pid\"\n\
+             echo \"$pid\"",
+            command = shell_quote(command),
+        );
+        let output = self.exec(ExecRequest::plain(script)).await?;
+        if output.exit_code != 0 {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "could not spawn background job (exit {}): {}",
+                output.exit_code,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let pid: u32 = stdout.trim().parse().map_err(|_| {
+            Error::Io(std::io::Error::other(format!(
+                "spawn did not report a pid (got {:?})",
+                stdout.trim()
+            )))
+        })?;
+        Ok(JobHandle {
+            sandbox: self,
+            id,
+            pid,
+        })
+    }
+
+    /// List the sandbox's background jobs (every `~/.xshellz/jobs/*.pid`
+    /// file) with a `kill -0` liveness probe for each.
+    pub async fn jobs(&self) -> Result<Vec<JobInfo>> {
+        const LIST_SCRIPT: &str = "[ -d \"$HOME/.xshellz/jobs\" ] || exit 0\n\
+             cd \"$HOME/.xshellz/jobs\" || exit 0\n\
+             for p in *.pid; do\n\
+             [ -e \"$p\" ] || continue\n\
+             id=\"${p%.pid}\"\n\
+             pid=\"$(cat \"$p\" 2>/dev/null)\"\n\
+             if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then alive=1; else alive=0; fi\n\
+             printf '%s %s %s\\n' \"$id\" \"${pid:-0}\" \"$alive\"\n\
+             done";
+        let output = self
+            .exec(ExecRequest::plain(LIST_SCRIPT.to_owned()))
+            .await?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let id = fields.next()?.to_owned();
+                let pid = fields.next()?.parse().unwrap_or(0);
+                let running = fields.next()? == "1";
+                Some(JobInfo {
+                    log_path: jobs::log_path_for(&id),
+                    id,
+                    pid,
+                    running,
+                })
+            })
+            .collect())
+    }
+
+    /// Run a snippet of code in the sandbox: the code is written to a temp
+    /// file, executed with the language's interpreter, and the temp file is
+    /// always deleted afterwards. Returns the same [`CommandResult`] as
+    /// [`run`](Self::run) - a non-zero exit code is data, not an `Err`.
+    ///
+    /// Supported languages: `python` (runs `python3`), `node`, `bash`,
+    /// `ruby`, `php`. The interpreter must be installed in the box (python3
+    /// and bash ship in the base image; install others via
+    /// [`run`](Self::run) or the account boxfile).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::UnsupportedLanguage`]: unknown `language`.
+    /// - Everything [`run`](Self::run) can return.
+    pub async fn run_code(
+        &self,
+        language: &str,
+        code: &str,
+        options: RunOptions,
+    ) -> Result<CommandResult> {
+        const LANGUAGES: [(&str, &str, &str); 5] = [
+            ("python", "python3", "py"),
+            ("node", "node", "js"),
+            ("bash", "bash", "sh"),
+            ("ruby", "ruby", "rb"),
+            ("php", "php", "php"),
+        ];
+        let lowered = language.to_ascii_lowercase();
+        let Some((_, interpreter, extension)) =
+            LANGUAGES.iter().find(|(name, _, _)| *name == lowered)
+        else {
+            return Err(Error::UnsupportedLanguage(format!(
+                "unsupported language {language:?}; supported: python, node, \
+                 bash, ruby, php"
+            )));
+        };
+        let path = format!("/tmp/.xshellz-code-{}.{extension}", jobs::short_id());
+        self.write_file(&path, code.as_bytes()).await?;
+        let result = self
+            .run(&format!("{interpreter} {}", shell_quote(&path)), options)
+            .await;
+        let _cleanup = self
+            .exec(ExecRequest::plain(format!("rm -f {}", shell_quote(&path))))
+            .await;
+        result
+    }
+
+    pub(crate) async fn exec(&self, request: ExecRequest) -> Result<ExecOutput> {
         let mut guard = self.transport.lock().await;
         let transport = match &mut *guard {
             Some(transport) => transport,
@@ -535,6 +914,59 @@ impl Sandbox {
         Ok(())
     }
 
+    /// Reboot a running box (`POST /shells/agent/{uuid}/restart`).
+    ///
+    /// The box's entrypoint re-runs and `/home` is preserved. Any live SSH
+    /// connection and background jobs die with the reboot; the SDK drops its
+    /// cached connection and reconnects on the next command.
+    pub async fn restart(&self) -> Result<()> {
+        let info: SandboxInfo = self
+            .api
+            .post(&format!("/shells/agent/{}/restart", self.uuid()), None)
+            .await?;
+        self.store_info(info);
+        self.transport.lock().await.take();
+        Ok(())
+    }
+
+    /// Live resource usage - memory, CPU, pids, disk, network - with the
+    /// plan's ceilings (`GET /shells/agent/{uuid}/stats`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Api`] with status 503 when the box's host or its live stats
+    /// are momentarily unavailable.
+    pub async fn stats(&self) -> Result<SandboxStats> {
+        self.api
+            .get(&format!("/shells/agent/{}/stats", self.uuid()))
+            .await
+    }
+
+    /// Top processes, active SSH session count, detected coding agents, and
+    /// disk usage (`GET /shells/agent/{uuid}/procs`).
+    pub async fn procs(&self) -> Result<SandboxProcs> {
+        self.api
+            .get(&format!("/shells/agent/{}/procs", self.uuid()))
+            .await
+    }
+
+    /// Mint a fresh signed web-terminal URL for this box
+    /// (`GET /shells/agent/{uuid}/terminal`).
+    ///
+    /// The URL embeds a short-lived HMAC token (valid ~1 hour); mint a fresh
+    /// one each time a terminal is opened rather than storing it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Api`] with status 404 when the box is not running.
+    pub async fn terminal_url(&self) -> Result<String> {
+        let response: TerminalUrlResponse = self
+            .api
+            .get(&format!("/shells/agent/{}/terminal", self.uuid()))
+            .await?;
+        Ok(response.url)
+    }
+
     /// Destroy the sandbox (`DELETE /shells/agent/{uuid}`). Idempotent: a
     /// 404 (already gone) is swallowed, and repeat calls are no-ops.
     pub async fn kill(&self) -> Result<()> {
@@ -588,6 +1020,19 @@ impl Sandbox {
             .expect("fresh sandbox mutex is uncontended") = transport;
         sandbox
     }
+}
+
+/// Wire shape of `GET`/`PUT /shells/agent/boxfile`.
+#[derive(Deserialize)]
+struct BoxfileManifest {
+    #[serde(default)]
+    manifest: Option<String>,
+}
+
+/// Wire shape of `GET /shells/agent/{uuid}/terminal`.
+#[derive(Deserialize)]
+struct TerminalUrlResponse {
+    url: String,
 }
 
 fn remote_file_error(action: &str, path: &str, output: &ExecOutput) -> Error {
@@ -850,6 +1295,212 @@ mod tests {
         );
         assert_eq!(tokio::fs::read(&local_out).await.unwrap(), b"payload");
         tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    fn stdout_output(stdout: &[u8], exit_code: i32) -> ExecOutput {
+        ExecOutput {
+            stdout: stdout.to_vec(),
+            stderr: Vec::new(),
+            exit_code,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_builds_nohup_script_and_parses_pid() {
+        let (sandbox, recorded) = sandbox_with(running_info(), vec![stdout_output(b"12345\n", 0)]);
+        let job = sandbox
+            .spawn("sleep 99", SpawnOptions::default().name("my worker"))
+            .await
+            .unwrap();
+
+        assert_eq!(job.pid(), 12345);
+        assert!(job.id().starts_with("my_worker-"), "id: {:?}", job.id());
+        assert_eq!(job.log_path(), format!("~/.xshellz/jobs/{}.log", job.id()));
+
+        let script = recorded.lock().unwrap()[0].command.clone();
+        assert!(script.contains("mkdir -p \"$HOME/.xshellz/jobs\""));
+        assert!(script.contains("nohup bash -c 'sleep 99' > \"$HOME/.xshellz/jobs/my_worker-"));
+        assert!(script.contains("2>&1 < /dev/null &"));
+        assert!(script.contains(".pid\""));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_without_pid_output_is_io_error() {
+        let (sandbox, _) = sandbox_with(running_info(), vec![stdout_output(b"not-a-pid", 0)]);
+        let err = sandbox
+            .spawn("true", SpawnOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Io(_)));
+        assert!(err.to_string().contains("pid"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn job_is_running_probes_with_kill_zero() {
+        let (sandbox, recorded) = sandbox_with(
+            running_info(),
+            vec![
+                stdout_output(b"42\n", 0),
+                stdout_output(b"", 0),
+                stdout_output(b"", 1),
+            ],
+        );
+        let job = sandbox
+            .spawn("true", SpawnOptions::default())
+            .await
+            .unwrap();
+        assert!(job.is_running().await.unwrap());
+        assert!(!job.is_running().await.unwrap());
+        assert_eq!(
+            recorded.lock().unwrap()[1].command,
+            "kill -0 42 2>/dev/null"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn job_logs_tails_the_log_file() {
+        let (sandbox, recorded) = sandbox_with(
+            running_info(),
+            vec![
+                stdout_output(b"7\n", 0),
+                stdout_output(b"line1\nline2\n", 0),
+            ],
+        );
+        let job = sandbox
+            .spawn("true", SpawnOptions::default())
+            .await
+            .unwrap();
+        let logs = job.logs(50).await.unwrap();
+        assert_eq!(logs, "line1\nline2\n");
+        assert_eq!(
+            recorded.lock().unwrap()[1].command,
+            format!("tail -n 50 \"$HOME/.xshellz/jobs/{}.log\"", job.id())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn job_stop_sends_term_then_kill_with_grace() {
+        let (sandbox, recorded) = sandbox_with(
+            running_info(),
+            vec![stdout_output(b"7\n", 0), stdout_output(b"", 0)],
+        );
+        let job = sandbox
+            .spawn("true", SpawnOptions::default())
+            .await
+            .unwrap();
+        job.stop().await.unwrap();
+        let script = recorded.lock().unwrap()[1].command.clone();
+        assert!(script.contains("kill -TERM 7 2>/dev/null"));
+        assert!(script.contains("kill -0 7 2>/dev/null || exit 0"));
+        assert!(script.contains("kill -KILL 7 2>/dev/null"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn jobs_lists_pid_files_with_liveness() {
+        let (sandbox, _) = sandbox_with(
+            running_info(),
+            vec![stdout_output(b"worker-aa 123 1\nold-bb 456 0\n", 0)],
+        );
+        let jobs = sandbox.jobs().await.unwrap();
+        assert_eq!(
+            jobs,
+            vec![
+                JobInfo {
+                    id: "worker-aa".to_owned(),
+                    pid: 123,
+                    running: true,
+                    log_path: "~/.xshellz/jobs/worker-aa.log".to_owned(),
+                },
+                JobInfo {
+                    id: "old-bb".to_owned(),
+                    pid: 456,
+                    running: false,
+                    log_path: "~/.xshellz/jobs/old-bb.log".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn jobs_empty_when_no_jobs_dir() {
+        let (sandbox, _) = sandbox_with(running_info(), vec![stdout_output(b"", 0)]);
+        assert!(sandbox.jobs().await.unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_code_writes_temp_file_runs_interpreter_and_cleans_up() {
+        let (sandbox, recorded) = sandbox_with(
+            running_info(),
+            vec![
+                stdout_output(b"", 0),
+                stdout_output(b"hi\n", 0),
+                stdout_output(b"", 0),
+            ],
+        );
+        let result = sandbox
+            .run_code("python", "print('hi')", RunOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(result.stdout, "hi\n");
+        assert_eq!(result.exit_code, 0);
+
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 3);
+        assert!(recorded[0]
+            .command
+            .starts_with("cat > '/tmp/.xshellz-code-"));
+        assert!(recorded[0].command.ends_with(".py'"));
+        assert_eq!(recorded[0].stdin.as_deref(), Some(&b"print('hi')"[..]));
+        assert!(recorded[1]
+            .command
+            .starts_with("python3 '/tmp/.xshellz-code-"));
+        assert!(recorded[2]
+            .command
+            .starts_with("rm -f '/tmp/.xshellz-code-"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_code_maps_languages_to_interpreters() {
+        for (language, interpreter, extension) in [
+            ("node", "node", ".js"),
+            ("BASH", "bash", ".sh"),
+            ("ruby", "ruby", ".rb"),
+            ("php", "php", ".php"),
+        ] {
+            let (sandbox, recorded) = sandbox_with(
+                running_info(),
+                vec![
+                    stdout_output(b"", 0),
+                    stdout_output(b"", 0),
+                    stdout_output(b"", 0),
+                ],
+            );
+            sandbox
+                .run_code(language, "1", RunOptions::default())
+                .await
+                .unwrap();
+            let recorded = recorded.lock().unwrap();
+            assert!(
+                recorded[0].command.contains(extension),
+                "{language}: temp file must use {extension}"
+            );
+            assert!(
+                recorded[1].command.starts_with(&format!("{interpreter} '")),
+                "{language}: must run {interpreter}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_code_unknown_language_is_typed_error() {
+        let (sandbox, recorded) = sandbox_with(running_info(), vec![]);
+        let err = sandbox
+            .run_code("cobol", "DISPLAY 'HI'", RunOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::UnsupportedLanguage(_)));
+        assert!(err.to_string().contains("python"));
+        assert!(recorded.lock().unwrap().is_empty(), "nothing must execute");
     }
 
     #[tokio::test(flavor = "multi_thread")]
